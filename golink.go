@@ -919,10 +919,6 @@ func (s *Server) serveDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	canEdit := s.canEditLink(r.Context(), link, cu)
-	ownerExists, err := s.userExists(r.Context(), link.Owner)
-	if err != nil {
-		log.Printf("looking up tailnet user %q: %v", link.Owner, err)
-	}
 
 	data := detailData{
 		Link:     link,
@@ -932,7 +928,7 @@ func (s *Server) serveDetail(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("exists") == "1" {
 		data.AlreadyExists = true
 	}
-	if canEdit && !ownerExists {
+	if canEdit && (link.Owner == "" || link.Owner == "tagged-devices") {
 		data.Link.Owner = cu.login
 	}
 
@@ -1339,7 +1335,7 @@ func (s *Server) serveSave(w http.ResponseWriter, r *http.Request) {
 
 // canEditLink returns whether the specified user has permission to edit link.
 // Admin users can edit all links.
-// Non-admin users can only edit their own links or links without an active owner.
+// Non-admin users can only edit their own links or explicitly shared links.
 func (s *Server) canEditLink(ctx context.Context, link *Link, u user) bool {
 	if s.readonly {
 		return false
@@ -1349,16 +1345,8 @@ func (s *Server) canEditLink(ctx context.Context, link *Link, u user) bool {
 		return true
 	}
 
-	if u.isAdmin || link.Owner == u.login {
-		return true
-	}
-
-	owned, err := s.userExists(ctx, link.Owner)
-	if err != nil {
-		log.Printf("looking up tailnet user %q: %v", link.Owner, err)
-	}
-	// Allow editing if the link is currently unowned
-	return err == nil && !owned
+	// Profile visibility is not evidence that an owner account was deleted.
+	return u.isAdmin || link.Owner == u.login || link.Owner == "tagged-devices"
 }
 
 // serveExport prints a snapshot of the link database. Links are JSON encoded

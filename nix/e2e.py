@@ -309,6 +309,51 @@ with subtest("owner deletion requires user-bound XSRF token"):
     request(alice, "/delete-me", status=404)
     request(alice, "/owned", status=302)
 
+with subtest("owner visibility loss never grants edit or delete rights"):
+    alice_account = next(
+        u
+        for u in json.loads(headscale.succeed("headscale users list -o json"))
+        if u["name"] == "alice"
+    )
+    save(bob, "hidden-owner", "https://example.com/preserved")
+    bob_token = token(bob, "hidden-owner")
+    save(bob, "hidden-owner", "https://example.com/preserved", owner="alice")
+    save(bob, "hidden-owner", status=403)
+    hidden_policy = json.loads(headscale.succeed("cat /etc/policy.json"))
+    hidden_policy["acls"][0]["src"] = ["bob@", "admin@", "tag:client"]
+    headscale.succeed(
+        "printf %s "
+        + shlex.quote(json.dumps(hidden_policy))
+        + " > /tmp/hidden-owner.json",
+        "headscale policy set -f /tmp/hidden-owner.json",
+    )
+    alice.wait_until_succeeds(
+        "tailscale status --json | jq -e 'all(.Peer[]; .HostName != \"go\")'",
+        timeout=60,
+    )
+    # Reconnect with a fresh map so cached user profiles cannot hide the regression.
+    server.succeed("systemctl restart golink")
+    bob.wait_until_succeeds(f"curl -fsS --max-time 5 {url}/", timeout=120)
+    assert alice_account in json.loads(
+        headscale.succeed("headscale users list -o json")
+    )
+    save(bob, "visibility-control")
+    request(
+        bob,
+        "/.delete/visibility-control",
+        data=dict(xsrf=token(bob, "visibility-control")),
+    )
+    save(bob, "hidden-owner", "https://attacker.example/", status=403)
+    request(bob, "/.delete/hidden-owner", data=dict(xsrf=bob_token), status=403)
+    hidden = json.loads(request(bob, "/.detail/hidden-owner"))
+    assert hidden["Owner"] == "alice"
+    assert hidden["Long"] == "https://example.com/preserved"
+    page = request(bob, "/.detail/hidden-owner", headers=["Accept: text/html"])
+    assert '<form method="POST"' not in page and "alice" in page
+    policy("policy")
+    alice.wait_until_succeeds(f"curl -fsS --max-time 5 {url}/", timeout=60)
+    save(alice, "hidden-owner", "https://example.com/owner-control")
+
 with subtest("departed owners and tagged clients"):
     bob_id = next(
         n["id"]
@@ -318,11 +363,8 @@ with subtest("departed owners and tagged clients"):
     bob.succeed("tailscale logout")
     headscale.succeed(f"headscale nodes delete --identifier {bob_id} --force")
     headscale.succeed("headscale users destroy --name bob --force")
-    # Orphan detection uses the real LocalAPI user map, which updates asynchronously.
-    alice.wait_until_succeeds(
-        f"curl -sS --max-time 5 -o /dev/null -w '%{{http_code}}' -H 'Sec-Golink: test' --data 'short=bob-control&long=https://example.com/reclaimed' {url}/ | grep '^200$'",
-        timeout=60,
-    )
+    save(alice, "bob-control", status=403)
+    save(admin, "bob-control", "https://example.com/reclaimed", owner="alice")
     assert detail("bob-control")["Owner"] == "alice"
     tagged_key = headscale.succeed("hs-authkey admin --tags tag:client").strip()
     bob.succeed("hs-join " + shlex.quote(tagged_key))

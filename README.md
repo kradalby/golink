@@ -321,8 +321,9 @@ $ modal deploy golinks.py
 
 By default, users own the links they create and only they can update or delete those links.
 Ownership can be transferred to another user from the link edit page.
-Links whose owner is no longer part of the tailnet can be edited by any user,
-at which point that user will become the new owner.
+Links retain their owner when that user is no longer visible in the tailnet.
+Visibility does not prove that an account was deleted. An administrator can
+explicitly transfer a departed owner's links to another user.
 
 Users can be granted admin access to edit all links using [ACL grants] in your tailnet policy file.
 For example, if you have your golink instance tagged with `tag:golink` and a user group named `group:golink-admins`,
