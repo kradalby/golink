@@ -1046,8 +1046,9 @@ type capabilities struct {
 }
 
 type user struct {
-	login   string
-	isAdmin bool
+	login           string
+	isAdmin         bool
+	isAuthenticated bool
 }
 
 // defaultCurrentUser returns the Tailscale user associated with the request.
@@ -1061,7 +1062,7 @@ type user struct {
 // For regular mode, authentication uses WhoIs with the connection's RemoteAddr.
 func (s *Server) defaultCurrentUser(r *http.Request) (user, error) {
 	if s.dev {
-		return user{login: "foo@example.com"}, nil
+		return user{login: "foo@example.com", isAuthenticated: true}, nil
 	}
 
 	// When running as a Tailscale Service, identity headers are automatically injected
@@ -1084,14 +1085,14 @@ func (s *Server) defaultCurrentUser(r *http.Request) (user, error) {
 		}
 		return user{}, err
 	}
-	login := whois.UserProfile.LoginName
+	u := user{login: whois.UserProfile.LoginName, isAuthenticated: true}
 	caps, _ := tailcfg.UnmarshalCapJSON[capabilities](whois.CapMap, peerCapName)
 	for _, cap := range caps {
 		if cap.Admin {
-			return user{login: login, isAdmin: true}, nil
+			u.isAdmin = true
 		}
 	}
-	return user{login: login}, nil
+	return u, nil
 }
 
 // defaultTrustIdentityHeaders returns whether we should trust identity headers
@@ -1110,6 +1111,7 @@ func (s *Server) defaultTrustIdentityHeaders(r *http.Request) bool {
 // by tsnet's internal proxy.
 func (s *Server) defaultExtractUserFromHeaders(r *http.Request) user {
 	if tsLogin := r.Header.Get("Tailscale-User-Login"); tsLogin != "" {
+		u := user{login: tsLogin, isAuthenticated: true}
 		// Look for a peer from x-forwarded-for header. We'll use that for the
 		// whois/capmap lookup first.
 		xff := r.Header.Get("X-Forwarded-For")
@@ -1121,21 +1123,21 @@ func (s *Server) defaultExtractUserFromHeaders(r *http.Request) user {
 			// only accept well-formed IP addresses
 			if net.ParseIP(ip) == nil {
 				log.Printf("invalid IP in X-Forwarded-For header: %q", ip)
-				return user{login: tsLogin}
+				return u
 			}
 
 			whois, err := s.whoisFunc(r.Context(), ip)
 
 			if err != nil {
 				log.Printf("WhoIs lookup for IP %q: %v", ip, err)
-				return user{login: tsLogin}
+				return u
 			}
 
 			caps, _ := tailcfg.UnmarshalCapJSON[capabilities](whois.CapMap, peerCapName)
 
 			for _, cap := range caps {
 				if cap.Admin {
-					return user{login: tsLogin, isAdmin: true}
+					u.isAdmin = true
 				}
 			}
 
@@ -1143,7 +1145,7 @@ func (s *Server) defaultExtractUserFromHeaders(r *http.Request) user {
 
 		// If we can't determine admin status, just return the user without admin privileges
 		// This allows the service to continue functioning even if the lookup fails
-		return user{login: tsLogin}
+		return u
 	}
 	return user{}
 }
@@ -1474,7 +1476,7 @@ func (s *Server) resolveLink(link *url.URL) (*url.URL, error) {
 }
 
 func (s *Server) isRequestAuthorized(r *http.Request, u user, short string) bool {
-	if s.allowUnknownUsers {
+	if s.allowUnknownUsers && !u.isAuthenticated && u.login == "" {
 		return true
 	}
 	if r.Header.Get(secHeaderName) != "" {
