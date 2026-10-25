@@ -4,12 +4,14 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     systems.url = "github:nix-systems/default";
+    headscale.url = "github:juanfont/headscale/30ff8df93c4fbd734a2b8ace4cb9841da78177d6";
   };
 
   outputs =
     { self
     , nixpkgs
     , systems
+    , headscale
     ,
     }:
     let
@@ -25,6 +27,11 @@
     in
     {
       formatter = eachSystem (pkgs: pkgs.nixpkgs-fmt);
+
+      checks = eachSystem (pkgs: pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        e2e = import ./nix/e2e.nix { inherit pkgs self headscale; };
+        e2e-http = import ./nix/e2e.nix { inherit pkgs self headscale; https = false; };
+      });
 
       devShells = eachSystem (pkgs: {
         default = pkgs.mkShell { buildInputs = [ pkgs.go_1_27 ]; };
