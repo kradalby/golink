@@ -38,6 +38,7 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
+	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 	"tailscale.com/util/dnsname"
@@ -364,6 +365,10 @@ func Run(ctx context.Context) error {
 	}
 
 	// create tsNet server and wait for it to be ready & connected.
+	// Opt out only on hosts where interface binding prevents unprivileged routing.
+	if envknob.Bool("GOLINK_DISABLE_NETWORK_NAMESPACES") {
+		netns.SetEnabled(false)
+	}
 	ts := &tsnet.Server{
 		ControlURL:    *controlURL,
 		Dir:           *configDir,
@@ -378,6 +383,7 @@ func Run(ctx context.Context) error {
 	if err := ts.Start(); err != nil {
 		return err
 	}
+	defer ts.Close()
 
 	lc, err := ts.LocalClient()
 	if err != nil {
@@ -386,15 +392,18 @@ func Run(ctx context.Context) error {
 	s.lc = lc
 out:
 	for {
-		upCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
+		if ctx.Err() != nil {
+			return nil
+		}
+		upCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		status, err := ts.Up(upCtx)
+		cancel()
 		if err == nil && status != nil {
 			break out
 		}
 	}
 
-	statusCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	statusCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	status, err := lc.Status(statusCtx)
 	if err != nil {
@@ -670,16 +679,12 @@ func RedirectHandler(hostname string) http.Handler {
 // response on non fully qualified domain name origins.
 func HSTS(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host, found := r.Header["Host"]
-		if found {
-			host := host[0]
-			fqdn, err := dnsname.ToFQDN(host)
-			if err == nil {
-				segCount := fqdn.NumLabels()
-				if segCount > 1 {
-					w.Header().Set("Strict-Transport-Security", "max-age=31536000")
-				}
-			}
+		host := r.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		if fqdn, err := dnsname.ToFQDN(host); err == nil && fqdn.NumLabels() > 1 {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
 		}
 		h.ServeHTTP(w, r)
 	})

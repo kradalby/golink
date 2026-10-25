@@ -7,11 +7,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
@@ -19,7 +22,9 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/net/xsrftoken"
+	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/net/socks5"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/util/must"
@@ -750,12 +755,15 @@ func TestNoHSTSShortDomain(t *testing.T) {
 			host:       "go.prawn-universe.ts.net",
 			expectHsts: true,
 		},
+		{
+			host:       "go.prawn-universe.ts.net:443",
+			expectHsts: true,
+		},
 	}
 	for _, tt := range tests {
 		name := "HSTS: " + tt.host
 		t.Run(name, func(t *testing.T) {
-			r := httptest.NewRequest("GET", "/foobar", nil)
-			r.Header.Add("Host", tt.host)
+			r := httptest.NewRequest("GET", "https://"+tt.host+"/foobar", nil)
 
 			w := httptest.NewRecorder()
 			HSTS(s.Handler()).ServeHTTP(w, r)
@@ -1164,5 +1172,80 @@ func TestServeHTTPReturnsServeError(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("serveHTTP did not return after the listener closed")
+	}
+}
+
+func TestRunUsesSOCKSProxy(t *testing.T) {
+	if dir := os.Getenv("GOLINK_TEST_PROXY_STATE"); dir != "" {
+		flag.CommandLine = flag.NewFlagSet("golink", flag.ContinueOnError)
+		os.Args = []string{"golink", "-config-dir", dir, "-sqlitedb", ":memory:", "-control-url", "http://192.0.2.1", "-verbose"}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := Run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	proxied := make(chan struct{}, 1)
+	proxy := &socks5.Server{
+		Logf: t.Logf,
+		Dialer: func(_ context.Context, _, addr string) (net.Conn, error) {
+			if host, _, _ := net.SplitHostPort(addr); host == "192.0.2.1" {
+				select {
+				case proxied <- struct{}{}:
+				default:
+				}
+			}
+			return nil, errors.New("test proxy refuses upstream connections")
+		},
+	}
+	go proxy.Serve(ln)
+
+	// Run owns process-global flags and tsnet state, so isolate it in a subprocess.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRunUsesSOCKSProxy$")
+	cmd.Env = append(os.Environ(),
+		"GOLINK_TEST_PROXY_STATE="+t.TempDir(),
+		"ALL_PROXY=socks5://"+ln.Addr().String(), "NO_PROXY=", "no_proxy=", "HTTP_PROXY=", "HTTPS_PROXY=",
+		"http_proxy=", "https_proxy=",
+		"TS_AUTHKEY=invalid-test-auth-key", "TS_NO_LOGS_NO_SUPPORT=1", "GOLINK_DISABLE_NETWORK_NAMESPACES=",
+		// Nix sandboxes expose only loopback, where the test proxy listens.
+		"TS_ASSUME_NETWORK_UP_FOR_TEST=1",
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("golink subprocess: %v\n%s", err, output)
+	}
+	select {
+	case <-proxied:
+	default:
+		t.Fatalf("golink bypassed ALL_PROXY for control traffic\n%s", output)
+	}
+}
+
+func TestCurrentUserWhoIsFailure(t *testing.T) {
+	for _, allowUnknown := range []bool{false, true} {
+		t.Run(fmt.Sprintf("allowUnknown=%v", allowUnknown), func(t *testing.T) {
+			s := &Server{
+				allowUnknownUsers: allowUnknown,
+				lc: &local.Client{Dial: func(context.Context, string, string) (net.Conn, error) {
+					return nil, errors.New("LocalAPI unavailable")
+				}},
+			}
+			s.trustIdentityHeaders = s.defaultTrustIdentityHeaders
+			r := httptest.NewRequest("GET", "http://go/", nil)
+			r.RemoteAddr = "100.64.0.1:1234"
+			got, err := s.defaultCurrentUser(r)
+			if (err == nil) != allowUnknown || got != (user{}) {
+				t.Fatalf("defaultCurrentUser = %v, %v; allowUnknown=%v", got, err, allowUnknown)
+			}
+		})
 	}
 }
