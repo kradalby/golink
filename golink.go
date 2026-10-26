@@ -38,8 +38,6 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
-	"tailscale.com/ipn/ipnstate"
-	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 	"tailscale.com/util/dnsname"
@@ -116,10 +114,6 @@ type Options struct {
 	// tsnet's internal proxy are trusted for requests from loopback.
 	ServiceName string
 
-	// IdentityScope is an operator-assigned immutable tailnet namespace. When
-	// set, it takes precedence over the control server's reported stable ID.
-	IdentityScope string
-
 	// Dev runs the server in development mode: requests are authenticated as
 	// a fake user without consulting the LocalAPI.
 	Dev bool
@@ -137,7 +131,6 @@ type Server struct {
 	readonly          bool
 	allowUnknownUsers bool
 	serviceName       string
-	identityScope     string
 	dev               bool
 	verbose           bool
 
@@ -200,7 +193,6 @@ func New(opts Options) (*Server, error) {
 		readonly:          opts.ReadOnly,
 		allowUnknownUsers: opts.AllowUnknownUsers,
 		serviceName:       opts.ServiceName,
-		identityScope:     opts.IdentityScope,
 		dev:               opts.Dev,
 		verbose:           opts.Verbose,
 	}
@@ -258,7 +250,6 @@ func Run(ctx context.Context) error {
 		readonly          = flag.Bool("readonly", false, "start golink server in read-only mode")
 		advertiseTags     = flag.String("advertise-tags", os.Getenv("TS_ADVERTISE_TAGS"), "comma-separated list of ACL tags to advertise (e.g. tag:golink)")
 		serviceName       = flag.String("register-as-service", envknob.String("TS_SERVICE_NAME"), "register as a Tailscale Service (e.g., svc:golink); requires tagged node")
-		identityScope     = flag.String("identity-scope", "", "immutable operator-assigned tailnet scope when the control server provides none")
 	)
 	flag.Parse()
 
@@ -312,7 +303,6 @@ func Run(ctx context.Context) error {
 		ReadOnly:          *readonly,
 		AllowUnknownUsers: *allowUnknownUsers,
 		ServiceName:       *serviceName,
-		IdentityScope:     *identityScope,
 		Dev:               devMode(),
 		Verbose:           *verbose,
 	})
@@ -374,10 +364,6 @@ func Run(ctx context.Context) error {
 	}
 
 	// create tsNet server and wait for it to be ready & connected.
-	// Opt out only on hosts where interface binding prevents unprivileged routing.
-	if envknob.Bool("GOLINK_DISABLE_NETWORK_NAMESPACES") {
-		netns.SetEnabled(false)
-	}
 	ts := &tsnet.Server{
 		ControlURL:    *controlURL,
 		Dir:           *configDir,
@@ -392,7 +378,6 @@ func Run(ctx context.Context) error {
 	if err := ts.Start(); err != nil {
 		return err
 	}
-	defer ts.Close()
 
 	lc, err := ts.LocalClient()
 	if err != nil {
@@ -401,18 +386,15 @@ func Run(ctx context.Context) error {
 	s.lc = lc
 out:
 	for {
-		if ctx.Err() != nil {
-			return nil
-		}
-		upCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		upCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
 		status, err := ts.Up(upCtx)
-		cancel()
 		if err == nil && status != nil {
 			break out
 		}
 	}
 
-	statusCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	statusCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	status, err := lc.Status(statusCtx)
 	if err != nil {
@@ -688,12 +670,16 @@ func RedirectHandler(hostname string) http.Handler {
 // response on non fully qualified domain name origins.
 func HSTS(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host := r.Host
-		if h, _, err := net.SplitHostPort(host); err == nil {
-			host = h
-		}
-		if fqdn, err := dnsname.ToFQDN(host); err == nil && fqdn.NumLabels() > 1 {
-			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+		host, found := r.Header["Host"]
+		if found {
+			host := host[0]
+			fqdn, err := dnsname.ToFQDN(host)
+			if err == nil {
+				segCount := fqdn.NumLabels()
+				if segCount > 1 {
+					w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+				}
+			}
 		}
 		h.ServeHTTP(w, r)
 	})
@@ -777,7 +763,7 @@ func (s *Server) serveHome(w http.ResponseWriter, r *http.Request, short string)
 		Short:    short,
 		Long:     long,
 		Clicks:   clicks,
-		XSRF:     xsrftoken.Generate(s.xsrfKey, cu.xsrfIdentity(), newShortName),
+		XSRF:     xsrftoken.Generate(s.xsrfKey, cu.login, newShortName),
 		ReadOnly: s.readonly,
 		User:     cu.login,
 	})
@@ -893,8 +879,6 @@ type detailData struct {
 	Link          *Link
 	XSRF          string
 	AlreadyExists bool
-	NeedsOwner    bool
-	Owners        []ownerChoice
 }
 
 func (s *Server) serveDetail(w http.ResponseWriter, r *http.Request) {
@@ -905,14 +889,14 @@ func (s *Server) serveDetail(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if err != nil {
-		log.Printf("serving detail %q: %v", short, err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 	if short != link.Short {
 		// redirect to canonical short name
 		http.Redirect(w, r, "/.detail/"+link.Short, http.StatusFound)
+		return
+	}
+	if err != nil {
+		log.Printf("serving detail %q: %v", short, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -930,21 +914,21 @@ func (s *Server) serveDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	canEdit := s.canEditLink(r.Context(), link, cu)
+	ownerExists, err := s.userExists(r.Context(), link.Owner)
+	if err != nil {
+		log.Printf("looking up tailnet user %q: %v", link.Owner, err)
+	}
 
 	data := detailData{
-		Link:       link,
-		Editable:   canEdit,
-		XSRF:       xsrftoken.Generate(s.xsrfKey, cu.xsrfIdentity(), link.Short),
-		NeedsOwner: link.needsOwner(),
+		Link:     link,
+		Editable: canEdit,
+		XSRF:     xsrftoken.Generate(s.xsrfKey, cu.login, link.Short),
 	}
 	if r.URL.Query().Get("exists") == "1" {
 		data.AlreadyExists = true
 	}
-	if canEdit {
-		data.Owners, err = s.ownerChoices(r.Context())
-		if err != nil {
-			log.Printf("looking up transfer targets: %v", err)
-		}
+	if canEdit && !ownerExists {
+		data.Link.Owner = cu.login
 	}
 
 	s.detailTmpl.Execute(w, data)
@@ -1057,11 +1041,8 @@ type capabilities struct {
 }
 
 type user struct {
-	login           string
-	ownerID         string
-	nodeID          string
-	isAdmin         bool
-	isAuthenticated bool
+	login   string
+	isAdmin bool
 }
 
 // defaultCurrentUser returns the Tailscale user associated with the request.
@@ -1075,7 +1056,7 @@ type user struct {
 // For regular mode, authentication uses WhoIs with the connection's RemoteAddr.
 func (s *Server) defaultCurrentUser(r *http.Request) (user, error) {
 	if s.dev {
-		return user{login: "foo@example.com", ownerID: "dev/foo@example.com", isAuthenticated: true}, nil
+		return user{login: "foo@example.com"}, nil
 	}
 
 	// When running as a Tailscale Service, identity headers are automatically injected
@@ -1084,7 +1065,7 @@ func (s *Server) defaultCurrentUser(r *http.Request) (user, error) {
 	// on loopback.
 	if s.trustIdentityHeaders(r) {
 		headerUser := s.extractUserFromHeaders(r)
-		if headerUser.isAuthenticated {
+		if headerUser.login != "" {
 			return headerUser, nil
 		}
 	}
@@ -1098,43 +1079,14 @@ func (s *Server) defaultCurrentUser(r *http.Request) (user, error) {
 		}
 		return user{}, err
 	}
-	return s.userFromWhoIs(r.Context(), whois), nil
-}
-
-const taggedOwnerID = "tagged"
-
-func (u user) xsrfIdentity() string {
-	if u.ownerID == taggedOwnerID {
-		return u.nodeID
-	}
-	return u.ownerID
-}
-
-func (s *Server) userFromWhoIs(ctx context.Context, whois *apitype.WhoIsResponse) user {
-	u := user{isAuthenticated: true}
-	if whois == nil {
-		return u
-	}
-	if whois.UserProfile != nil {
-		u.login = whois.UserProfile.LoginName
-	}
-	if whois.Node != nil && len(whois.Node.Tags) > 0 {
-		u.login, u.ownerID = "tagged-devices", taggedOwnerID
-		if scope, _, err := s.identityDirectory(ctx); err == nil && whois.Node.ID > 0 {
-			u.nodeID = scope + "/node/" + fmt.Sprint(int64(whois.Node.ID))
-		}
-	} else if whois.UserProfile != nil && whois.UserProfile.ID > 0 {
-		if scope, _, err := s.identityDirectory(ctx); err == nil {
-			u.ownerID = scope + "/" + fmt.Sprint(int64(whois.UserProfile.ID))
-		}
-	}
+	login := whois.UserProfile.LoginName
 	caps, _ := tailcfg.UnmarshalCapJSON[capabilities](whois.CapMap, peerCapName)
 	for _, cap := range caps {
 		if cap.Admin {
-			u.isAdmin = true
+			return user{login: login, isAdmin: true}, nil
 		}
 	}
-	return u
+	return user{login: login}, nil
 }
 
 // defaultTrustIdentityHeaders returns whether we should trust identity headers
@@ -1152,111 +1104,70 @@ func (s *Server) defaultTrustIdentityHeaders(r *http.Request) bool {
 // defaultExtractUserFromHeaders extracts the user from HTTP headers injected
 // by tsnet's internal proxy.
 func (s *Server) defaultExtractUserFromHeaders(r *http.Request) user {
-	tsLogin := r.Header.Get("Tailscale-User-Login")
-	u := user{login: tsLogin, isAuthenticated: tsLogin != ""}
-	// Look for a peer from x-forwarded-for header. We'll use that for the
-	// whois/capmap lookup first.
-	xff := r.Header.Get("X-Forwarded-For")
-	if xff != "" {
-		// serve.go sets this to a single address, so we can just
-		// trim whitespace and use it.
-		ip := strings.TrimSpace(xff)
+	if tsLogin := r.Header.Get("Tailscale-User-Login"); tsLogin != "" {
+		// Look for a peer from x-forwarded-for header. We'll use that for the
+		// whois/capmap lookup first.
+		xff := r.Header.Get("X-Forwarded-For")
+		if xff != "" {
+			// serve.go sets this to a single address, so we can just
+			// trim whitespace and use it.
+			ip := strings.TrimSpace(xff)
 
-		// only accept well-formed IP addresses
-		if net.ParseIP(ip) == nil {
-			log.Printf("invalid IP in X-Forwarded-For header: %q", ip)
-			return u
+			// only accept well-formed IP addresses
+			if net.ParseIP(ip) == nil {
+				log.Printf("invalid IP in X-Forwarded-For header: %q", ip)
+				return user{login: tsLogin}
+			}
+
+			whois, err := s.whoisFunc(r.Context(), ip)
+
+			if err != nil {
+				log.Printf("WhoIs lookup for IP %q: %v", ip, err)
+				return user{login: tsLogin}
+			}
+
+			caps, _ := tailcfg.UnmarshalCapJSON[capabilities](whois.CapMap, peerCapName)
+
+			for _, cap := range caps {
+				if cap.Admin {
+					return user{login: tsLogin, isAdmin: true}
+				}
+			}
+
 		}
 
-		whois, err := s.whoisFunc(r.Context(), ip)
-
-		if err != nil {
-			log.Printf("WhoIs lookup for IP %q: %v", ip, err)
-			return u
-		}
-
-		resolved := s.userFromWhoIs(r.Context(), whois)
-		if resolved.login == "" {
-			resolved.login = tsLogin
-		}
-		return resolved
+		// If we can't determine admin status, just return the user without admin privileges
+		// This allows the service to continue functioning even if the lookup fails
+		return user{login: tsLogin}
 	}
-
-	// If we can't determine admin status, just return the user without admin privileges
-	// This allows the service to continue functioning even if the lookup fails
-	return u
+	return user{}
 }
 
-// identityDirectory scopes IDs to their issuer and an immutable tailnet namespace.
-func (s *Server) identityDirectory(ctx context.Context) (string, *ipnstate.Status, error) {
+// userExists returns whether a user exists with the specified login in the current tailnet.
+func (s *Server) userExists(ctx context.Context, login string) (bool, error) {
+	const userTaggedDevices = "tagged-devices" // owner of tagged devices
+
+	if login == userTaggedDevices {
+		return false, nil
+	}
+
 	if s.dev {
-		return "dev", nil, nil
+		// in dev mode, just assume the user exists
+		return true, nil
 	}
 	st, err := s.lc.Status(ctx)
 	if err != nil {
-		return "", nil, err
+		return false, err
 	}
-	kind, scope := "configured", s.identityScope
-	if scope == "" && st.CurrentTailnet != nil {
-		kind, scope = "reported", string(st.CurrentTailnet.StableID)
-	}
-	if scope == "" {
-		return "", nil, errors.New("missing stable tailnet identity; configure -identity-scope")
-	}
-	prefs, err := s.lc.GetPrefs(ctx)
-	if err != nil {
-		return "", nil, err
-	}
-	if prefs.ControlURL == "" {
-		return "", nil, errors.New("missing identity issuer")
-	}
-	key, err := json.Marshal([3]string{prefs.ControlURL, kind, scope})
-	return string(key), st, err
-}
-
-type ownerChoice struct {
-	ID     string
-	Login  string
-	UserID int64
-}
-
-func (s *Server) ownerChoices(ctx context.Context) ([]ownerChoice, error) {
-	scope, st, err := s.identityDirectory(ctx)
-	if err != nil || st == nil {
-		return nil, err
-	}
-	// Cached profiles can outlive peers, so named targets need untagged node evidence.
-	hasUntaggedNode := make(map[tailcfg.UserID]bool)
-	record := func(peer *ipnstate.PeerStatus) {
-		if peer != nil && !peer.IsTagged() {
-			hasUntaggedNode[peer.UserID] = true
+	for _, user := range st.User {
+		if user.LoginName == userTaggedDevices {
+			continue
+		}
+		if user.LoginName == login {
+			return true, nil
 		}
 	}
-	record(st.Self)
-	for _, peer := range st.Peer {
-		record(peer)
-	}
-	var owners []ownerChoice
-	for id, profile := range st.User {
-		if id > 0 && profile.ID == id && hasUntaggedNode[id] {
-			owners = append(owners, ownerChoice{ID: scope + "/" + fmt.Sprint(int64(id)), Login: profile.LoginName, UserID: int64(id)})
-		}
-	}
-	sort.Slice(owners, func(i, j int) bool {
-		if owners[i].Login == owners[j].Login {
-			return owners[i].UserID < owners[j].UserID
-		}
-		return owners[i].Login < owners[j].Login
-	})
-	return owners, nil
-}
-
-func (l *Link) needsOwner() bool {
-	return l != nil && l.OwnerID == "" && l.Owner != ""
-}
-
-func (l *Link) shared() bool {
-	return l.OwnerID == taggedOwnerID || (l.OwnerID == "" && l.Owner == "")
+	return false, nil
 }
 
 var reShortName = regexp.MustCompile(`^\w[\w\-\.]*$`)
@@ -1283,12 +1194,8 @@ func (s *Server) serveDelete(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 
-	if link.needsOwner() || !s.canEditLink(r.Context(), link, cu) {
+	if !s.canEditLink(r.Context(), link, cu) {
 		http.Error(w, fmt.Sprintf("cannot delete link owned by %q", link.Owner), http.StatusForbidden)
 		return
 	}
@@ -1298,15 +1205,12 @@ func (s *Server) serveDelete(w http.ResponseWriter, r *http.Request) {
 	// want to enable deletion via CLI and to honor allowUnknownUsers for
 	// deletion, we could change the below to a call to isRequestAuthorized. For
 	// now, always require the XSRF token, thus maintaining the status quo.
-	if (cu.isAuthenticated && cu.xsrfIdentity() == "") || !xsrftoken.Valid(r.PostFormValue("xsrf"), s.xsrfKey, cu.xsrfIdentity(), link.Short) {
+	if !xsrftoken.Valid(r.PostFormValue("xsrf"), s.xsrfKey, cu.login, link.Short) {
 		http.Error(w, "invalid XSRF token", http.StatusBadRequest)
 		return
 	}
 
-	if err := s.db.deleteAuthorized(link); errors.Is(err, errLinkChanged) {
-		http.Error(w, err.Error(), http.StatusConflict)
-		return
-	} else if err != nil {
+	if err := s.db.Delete(short); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1315,7 +1219,7 @@ func (s *Server) serveDelete(w http.ResponseWriter, r *http.Request) {
 	s.deleteTmpl.Execute(w, deleteData{
 		Short: link.Short,
 		Long:  link.Long,
-		XSRF:  xsrftoken.Generate(s.xsrfKey, cu.xsrfIdentity(), newShortName),
+		XSRF:  xsrftoken.Generate(s.xsrfKey, cu.login, newShortName),
 	})
 }
 
@@ -1354,7 +1258,7 @@ func (s *Server) serveSave(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !s.canEditLink(r.Context(), link, cu) {
-		http.Error(w, "identity unavailable or link not editable", http.StatusForbidden)
+		http.Error(w, fmt.Sprintf("cannot update link owned by %q", link.Owner), http.StatusForbidden)
 		return
 	}
 
@@ -1381,58 +1285,35 @@ func (s *Server) serveSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Content edits never turn stale display text into an ownership transfer.
-	owner, ownerID := cu.login, cu.ownerID
-	if link != nil && !link.shared() {
-		owner, ownerID = link.Owner, link.OwnerID
-		if ownerID != "" && ownerID == cu.ownerID {
-			owner = cu.login
-		}
-	}
-	if r.FormValue("action") == "transfer" {
-		choices, err := s.ownerChoices(r.Context())
+	// allow transferring ownership to valid users. If empty, set owner to current user.
+	owner := r.FormValue("owner")
+	if owner != "" {
+		exists, err := s.userExists(r.Context(), owner)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			log.Printf("looking up tailnet user %q: %v", owner, err)
+		}
+		if !exists {
+			http.Error(w, "new owner not a valid user: "+owner, http.StatusBadRequest)
 			return
 		}
-		found := false
-		for _, choice := range choices {
-			if choice.ID == r.FormValue("owner-id") {
-				owner, ownerID, found = choice.Login, choice.ID, true
-				break
-			}
-		}
-		if !found {
-			http.Error(w, "select a verified immutable owner identity", http.StatusBadRequest)
-			return
-		}
-	} else if link.needsOwner() {
-		http.Error(w, "legacy ownership requires administrator reassignment", http.StatusForbidden)
-		return
+	} else {
+		owner = cu.login
 	}
 
 	now := time.Now().UTC()
 	newLink := false
-	before := link
 	if link == nil {
 		link = &Link{
 			Short:   short,
 			Created: now,
 		}
 		newLink = true
-	} else {
-		copy := *link
-		link = &copy
 	}
 	link.Short = short
 	link.Long = long
 	link.LastEdit = now
 	link.Owner = owner
-	link.OwnerID = ownerID
-	if err := s.db.saveAuthorized(link, before); errors.Is(err, errLinkChanged) {
-		http.Error(w, err.Error(), http.StatusConflict)
-		return
-	} else if err != nil {
+	if err := s.db.Save(link); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1451,21 +1332,26 @@ func (s *Server) serveSave(w http.ResponseWriter, r *http.Request) {
 
 // canEditLink returns whether the specified user has permission to edit link.
 // Admin users can edit all links.
-// Non-admin users can only edit their own links or explicitly shared links.
+// Non-admin users can only edit their own links or links without an active owner.
 func (s *Server) canEditLink(ctx context.Context, link *Link, u user) bool {
 	if s.readonly {
 		return false
 	}
-	if u.ownerID == "" && (u.isAuthenticated || u.login != "") {
-		return false
-	}
-	if link == nil || link.shared() {
+	if link == nil || link.Owner == "" {
 		// new or unowned link
 		return true
 	}
 
-	// Profile visibility is not evidence that an owner account was deleted.
-	return u.isAdmin || (link.OwnerID != "" && link.OwnerID == u.ownerID)
+	if u.isAdmin || link.Owner == u.login {
+		return true
+	}
+
+	owned, err := s.userExists(ctx, link.Owner)
+	if err != nil {
+		log.Printf("looking up tailnet user %q: %v", link.Owner, err)
+	}
+	// Allow editing if the link is currently unowned
+	return err == nil && !owned
 }
 
 // serveExport prints a snapshot of the link database. Links are JSON encoded
@@ -1548,9 +1434,7 @@ func (s *Server) restoreSnapshot(snapshot []byte) error {
 		} else if !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
-		if err := s.db.saveAuthorized(link, nil); errors.Is(err, errLinkChanged) {
-			continue // concurrently created
-		} else if err != nil {
+		if err := s.db.Save(link); err != nil {
 			return err
 		}
 		restored++
@@ -1585,14 +1469,14 @@ func (s *Server) resolveLink(link *url.URL) (*url.URL, error) {
 }
 
 func (s *Server) isRequestAuthorized(r *http.Request, u user, short string) bool {
-	if s.allowUnknownUsers && !u.isAuthenticated && u.login == "" {
+	if s.allowUnknownUsers {
 		return true
 	}
 	if r.Header.Get(secHeaderName) != "" {
 		return true
 	}
 
-	return (!u.isAuthenticated || u.xsrfIdentity() != "") && xsrftoken.Valid(r.PostFormValue("xsrf"), s.xsrfKey, u.xsrfIdentity(), short)
+	return xsrftoken.Valid(r.PostFormValue("xsrf"), s.xsrfKey, u.login, short)
 }
 
 // parseAdvertiseTags parses a comma-separated list of ACL tags.

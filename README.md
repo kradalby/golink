@@ -46,63 +46,6 @@ to be updated to reflect the new SHA256 of the go dependencies. This can be done
 ./update-flake.sh
 ```
 
-### Integration tests
-
-The Linux Nix checks use Headscale's exported `testkit` and `testkit-peer`
-modules with the golink package and NixOS service from this flake. They require
-KVM and run five VMs:
-
-```sh
-nix build \
-  .#checks.x86_64-linux.e2e .#checks.x86_64-linux.e2e-http \
-  --no-link -L
-go test ./...
-nix fmt -- --check flake.nix nix/e2e.nix
-```
-
-These VM checks run manually on a KVM-capable Linux host. Existing GitHub Actions
-build the package and run Go tests, but do not run the VM checks.
-
-Both checks exercise real WhoIs identities, tagged enrollment, link creation,
-lookup, redirects, owner search, ownership transfer, deletion and XSRF checks.
-They check forged identity headers, admin grants and live revocation, ACL/network
-denial with allowed-operation controls, departed owners, tagged clients,
-direct traffic, forced DERP traffic, invalid authentication, control outages,
-and persistence of links, click statistics and node identity across restart
-without an auth key. The service runs as its normal unprivileged user without
-extra capabilities. The fixture sets `GOLINK_DISABLE_NETWORK_NAMESPACES=1` so
-tsnet uses ordinary host routing on its multiple network interfaces. This is an
-opt-in workaround for unprivileged hosts where interface binding prevents
-connectivity. It also disables tsnet's SOCKS proxy support and routing-loop
-protection; leave it unset on hosts that need those features. Production defaults
-remain unchanged, and a Go regression test checks `ALL_PROXY` control traffic.
-
-`e2e` tests automatic HTTPS selection, HTTP redirects, HSTS and certificate validation.
-It seeds tsnet's existing certificate cache with a test certificate trusted only
-inside the fixture. `e2e-http` tests automatic HTTP fallback when Headscale does
-not advertise HTTPS. Neither test disables application TLS verification or
-changes the production HTTPS default. Headscale's self-signed DERP certificate
-is separate from the application certificate.
-The explicit `-https=false` override with HTTPS-capable control is not exercised.
-
-**These grant tests require a Headscale compatibility patch.** The pinned
-revision rejects `tailscale.com/cap/golink` because its
-public app-capability allowlist omits golink. The fixture carries
-`nix/headscale-golink-cap.patch`, which adds only that capability. The tests use
-the real grant and WhoIs capability map, and verify that an unrecognized reserved
-capability is still rejected. Remove the patch when using a Headscale revision
-that includes this entry; unpatched Headscale at this pin cannot grant golink
-admin access.
-
-Public ACME issuance and renewal are not exercised. Successful cloud Funnel is
-also untested; golink does not call `ListenFunnel`. The pinned Headscale fixture
-does not provide Tailscale Service VIP allocation and approval, so the optional
-`ListenService` path and its internal identity-header proxy are not exercised
-end to end. Existing Go tests cover that header trust boundary and failed WhoIs
-lookups, including ordinary-mode LocalAPI failure with and without unknown-user
-access, as well as read-only options; the VM tests do not emulate anonymous
-clients arriving through a subnet router.
-
 ## Joining a tailnet
 
 Create an [auth key] for your tailnet at <https://login.tailscale.com/admin/settings/keys>.
@@ -321,44 +264,8 @@ $ modal deploy golinks.py
 
 By default, users own the links they create and only they can update or delete those links.
 Ownership can be transferred to another user from the link edit page.
-Ownership follows the immutable user ID, scoped to the control-server issuer and
-tailnet. Login names are display labels. Ordinary saves preserve ownership,
-including saves from older open forms. Use **Transfer ownership** and verify the
-displayed user ID to assign a different owner; a login label alone is insufficient.
-Named transfer targets require an observed untagged node in the current tailnet
-status. Cached profiles alone cannot establish that a target is a person.
-Links retain their owner when that user is no longer visible in the tailnet.
-Visibility does not prove that an account was deleted. An administrator can
-explicitly transfer a departed owner's links to another user.
-
-On upgrade, the database adds an optional `OwnerID` column without assigning
-historical names to today's accounts. Existing named links remain readable and
-resolvable, with their labels, timestamps and click statistics intact. An
-administrator must verify and explicitly reassign each legacy owner before that
-link can be edited or deleted. Legacy `tagged-devices` labels are also ambiguous.
-New links from authenticated tagged nodes remain shared; unowned links remain shared.
-
-Control servers that do not report a stable tailnet ID, including the pinned
-Headscale fixture, require `-identity-scope` (NixOS: `services.golink.identityScope`).
-Choose an immutable unique value for that tailnet, not its display domain. An
-explicitly configured scope takes precedence and has a separate namespace from
-reported IDs. Keep both issuer URL and scope unchanged across restarts and
-restores. Changing either requires explicit administrator recovery; scopes are
-never silently aliased. Without sufficient identity, named writes fail closed;
-trusted Service headers without a successful immutable identity lookup are not
-anonymous and cannot acquire ownership.
-
-For API transfers, submit `action=transfer` and the complete `owner-id` value
-offered by the detail form, with normal XSRF or `Sec-Golink` protection. The old
-`owner` text parameter no longer transfers ownership. Concurrent ownership
-changes or creation collisions return HTTP 409; reload before retrying.
-XSRF tokens bind to immutable user identities (or individual tagged nodes),
-so accounts sharing a display label cannot reuse one another's tokens.
-
-Do not run old and new writers against the same database. Old writers and old
-exports can erase identity bindings, including by making links unowned. Rollback
-must be offline or read-only; downgrading authorization does not retain these
-protections. Back up the database before upgrading.
+Links whose owner is no longer part of the tailnet can be edited by any user,
+at which point that user will become the new owner.
 
 Users can be granted admin access to edit all links using [ACL grants] in your tailnet policy file.
 For example, if you have your golink instance tagged with `tag:golink` and a user group named `group:golink-admins`,
@@ -404,9 +311,6 @@ At Tailscale, we snapshot our links weekly and store them in git.
 
 To restore links, specify the snapshot file on startup.
 Only links that don't already exist in the database will be added.
-New snapshots retain `OwnerID`; older snapshots retain their data but require
-the same explicit legacy-owner recovery. Link snapshots do not include click
-statistics; those are exported separately from `/.export-stats`.
 
     golink -snapshot links.json
 

@@ -4,8 +4,7 @@ CREATE TABLE IF NOT EXISTS Links (
 	Long     TEXT    NOT NULL DEFAULT "",
 	Created  INTEGER NOT NULL DEFAULT (strftime('%s', 'now')), -- unix seconds
 	LastEdit INTEGER NOT NULL DEFAULT (strftime('%s', 'now')), -- unix seconds
-	Owner	 TEXT    NOT NULL DEFAULT "",
-	OwnerID  TEXT    NOT NULL DEFAULT ""
+	Owner	 TEXT    NOT NULL DEFAULT ""
 );
 
 CREATE TABLE IF NOT EXISTS Stats (

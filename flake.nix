@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     systems.url = "github:nix-systems/default";
-    headscale.url = "github:juanfont/headscale/30ff8df93c4fbd734a2b8ace4cb9841da78177d6";
+    headscale.url = "github:juanfont/headscale/main";
   };
 
   outputs =
@@ -29,8 +29,7 @@
       formatter = eachSystem (pkgs: pkgs.nixpkgs-fmt);
 
       checks = eachSystem (pkgs: pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-        e2e = import ./nix/e2e.nix { inherit pkgs self headscale; };
-        e2e-http = import ./nix/e2e.nix { inherit pkgs self headscale; https = false; };
+        e2e-http = import ./nix/e2e.nix { inherit pkgs self headscale; };
       });
 
       devShells = eachSystem (pkgs: {
@@ -126,12 +125,6 @@
               '';
             };
 
-            identityScope = mkOption {
-              type = types.str;
-              default = "";
-              description = "Immutable operator-assigned tailnet scope for controls without a stable tailnet ID. Keep it unchanged across restarts and restores.";
-            };
-
             tailscaleAuthKeyFile = mkOption {
               type = types.nullOr types.path;
               default = null;
@@ -168,7 +161,6 @@
                   args = [
                     "--sqlitedb ${cfg.databaseFile}"
                     "--control-url ${cfg.controlUrl}"
-                    "--identity-scope ${escapeShellArg cfg.identityScope}"
                   ] ++ optionals cfg.verbose [ "--verbose" ];
                 in
                 ''

@@ -26,7 +26,6 @@ type Link struct {
 	Created  time.Time
 	LastEdit time.Time // when the link was last edited
 	Owner    string    // user@domain
-	OwnerID  string    `json:",omitempty"` // scoped authority; Owner is only a display label
 }
 
 // ClickStats is the number of clicks a set of links have received in a given
@@ -62,20 +61,7 @@ func NewSQLiteDB(f string) (*SQLiteDB, error) {
 	}
 
 	if _, err = db.Exec(sqlSchema); err != nil {
-		db.Close()
 		return nil, err
-	}
-	var hasOwnerID bool
-	if err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM pragma_table_info('Links') WHERE name = 'OwnerID')").Scan(&hasOwnerID); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if !hasOwnerID {
-		// Historical labels cannot identify their original principals.
-		if _, err := db.Exec("ALTER TABLE Links ADD COLUMN OwnerID TEXT NOT NULL DEFAULT ''"); err != nil {
-			db.Close()
-			return nil, err
-		}
 	}
 
 	return &SQLiteDB{db: db}, nil
@@ -94,14 +80,14 @@ func (s *SQLiteDB) LoadAll() ([]*Link, error) {
 	defer s.mu.RUnlock()
 
 	var links []*Link
-	rows, err := s.db.Query("SELECT Short, Long, Created, LastEdit, Owner, OwnerID FROM Links")
+	rows, err := s.db.Query("SELECT Short, Long, Created, LastEdit, Owner FROM Links")
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		link := new(Link)
 		var created, lastEdit int64
-		err := rows.Scan(&link.Short, &link.Long, &created, &lastEdit, &link.Owner, &link.OwnerID)
+		err := rows.Scan(&link.Short, &link.Long, &created, &lastEdit, &link.Owner)
 		if err != nil {
 			return nil, err
 		}
@@ -123,8 +109,8 @@ func (s *SQLiteDB) Load(short string) (*Link, error) {
 
 	link := new(Link)
 	var created, lastEdit int64
-	row := s.db.QueryRow("SELECT Short, Long, Created, LastEdit, Owner, OwnerID FROM Links WHERE ID = ?1 LIMIT 1", linkID(short))
-	err := row.Scan(&link.Short, &link.Long, &created, &lastEdit, &link.Owner, &link.OwnerID)
+	row := s.db.QueryRow("SELECT Short, Long, Created, LastEdit, Owner FROM Links WHERE ID = ?1 LIMIT 1", linkID(short))
+	err := row.Scan(&link.Short, &link.Long, &created, &lastEdit, &link.Owner)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			err = fs.ErrNotExist
@@ -141,7 +127,7 @@ func (s *SQLiteDB) Save(link *Link) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	result, err := s.db.Exec("INSERT OR REPLACE INTO Links (ID, Short, Long, Created, LastEdit, Owner, OwnerID) VALUES (?, ?, ?, ?, ?, ?, ?)", linkID(link.Short), link.Short, link.Long, link.Created.Unix(), link.LastEdit.Unix(), link.Owner, link.OwnerID)
+	result, err := s.db.Exec("INSERT OR REPLACE INTO Links (ID, Short, Long, Created, LastEdit, Owner) VALUES (?, ?, ?, ?, ?, ?)", linkID(link.Short), link.Short, link.Long, link.Created.Unix(), link.LastEdit.Unix(), link.Owner)
 	if err != nil {
 		return err
 	}
@@ -151,52 +137,6 @@ func (s *SQLiteDB) Save(link *Link) error {
 	}
 	if rows != 1 {
 		return fmt.Errorf("expected to affect 1 row, affected %d", rows)
-	}
-	return nil
-}
-
-var errLinkChanged = errors.New("link ownership changed; reload before retrying")
-
-// saveAuthorized cannot replace ownership established after the caller's check.
-func (s *SQLiteDB) saveAuthorized(link, before *Link) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var result sql.Result
-	var err error
-	if before == nil {
-		result, err = s.db.Exec("INSERT INTO Links (ID, Short, Long, Created, LastEdit, Owner, OwnerID) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(ID) DO NOTHING", linkID(link.Short), link.Short, link.Long, link.Created.Unix(), link.LastEdit.Unix(), link.Owner, link.OwnerID)
-	} else {
-		result, err = s.db.Exec("UPDATE Links SET Short = ?, Long = ?, LastEdit = ?, Owner = ?, OwnerID = ? WHERE ID = ? AND Owner = ? AND OwnerID = ?", link.Short, link.Long, link.LastEdit.Unix(), link.Owner, link.OwnerID, linkID(before.Short), before.Owner, before.OwnerID)
-	}
-	if err != nil {
-		return err
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows != 1 {
-		return errLinkChanged
-	}
-	return nil
-}
-
-// deleteAuthorized leaves a concurrently transferred link and its stats intact.
-func (s *SQLiteDB) deleteAuthorized(link *Link) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	result, err := s.db.Exec("DELETE FROM Links WHERE ID = ? AND Owner = ? AND OwnerID = ?", linkID(link.Short), link.Owner, link.OwnerID)
-	if err != nil {
-		return err
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows != 1 {
-		return errLinkChanged
 	}
 	return nil
 }
@@ -292,14 +232,14 @@ func (s *SQLiteDB) GetLinksByOwner(owner string) ([]*Link, error) {
 	defer s.mu.RUnlock()
 
 	var links []*Link
-	rows, err := s.db.Query("SELECT Short, Long, Created, LastEdit, Owner, OwnerID FROM Links WHERE LOWER(Owner) = LOWER(?)", owner)
+	rows, err := s.db.Query("SELECT Short, Long, Created, LastEdit, Owner FROM Links WHERE LOWER(Owner) = LOWER(?)", owner)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		link := new(Link)
 		var created, lastEdit int64
-		err := rows.Scan(&link.Short, &link.Long, &created, &lastEdit, &link.Owner, &link.OwnerID)
+		err := rows.Scan(&link.Short, &link.Long, &created, &lastEdit, &link.Owner)
 		if err != nil {
 			return nil, err
 		}
