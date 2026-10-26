@@ -325,6 +325,8 @@ Ownership follows the immutable user ID, scoped to the control-server issuer and
 tailnet. Login names are display labels. Ordinary saves preserve ownership,
 including saves from older open forms. Use **Transfer ownership** and verify the
 displayed user ID to assign a different owner; a login label alone is insufficient.
+Named transfer targets require an observed untagged node in the current tailnet
+status. Cached profiles alone cannot establish that a target is a person.
 Links retain their owner when that user is no longer visible in the tailnet.
 Visibility does not prove that an account was deleted. An administrator can
 explicitly transfer a departed owner's links to another user.

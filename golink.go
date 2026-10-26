@@ -1225,11 +1225,11 @@ func (s *Server) ownerChoices(ctx context.Context) ([]ownerChoice, error) {
 	if err != nil || st == nil {
 		return nil, err
 	}
-	// Tagged-only profiles cannot authenticate as named owners.
+	// Cached profiles can outlive peers, so named targets need untagged node evidence.
 	hasUntaggedNode := make(map[tailcfg.UserID]bool)
 	record := func(peer *ipnstate.PeerStatus) {
-		if peer != nil {
-			hasUntaggedNode[peer.UserID] = hasUntaggedNode[peer.UserID] || !peer.IsTagged()
+		if peer != nil && !peer.IsTagged() {
+			hasUntaggedNode[peer.UserID] = true
 		}
 	}
 	record(st.Self)
@@ -1238,10 +1238,7 @@ func (s *Server) ownerChoices(ctx context.Context) ([]ownerChoice, error) {
 	}
 	var owners []ownerChoice
 	for id, profile := range st.User {
-		if untagged, known := hasUntaggedNode[id]; known && !untagged {
-			continue
-		}
-		if id > 0 && profile.ID == id {
+		if id > 0 && profile.ID == id && hasUntaggedNode[id] {
 			owners = append(owners, ownerChoice{ID: scope + "/" + fmt.Sprint(int64(id)), Login: profile.LoginName, UserID: int64(id)})
 		}
 	}

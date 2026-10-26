@@ -332,11 +332,13 @@ func TestOwnershipSurvivesLoginReuse(t *testing.T) {
 			})
 		case "/localapi/v0/status":
 			users := make(map[tailcfg.UserID]tailcfg.UserProfile)
+			peers := make(map[key.NodePublic]*ipnstate.PeerStatus)
 			for _, p := range profiles {
 				users[p.ID] = p
+				peers[key.NewNode().Public()] = &ipnstate.PeerStatus{UserID: p.ID}
 			}
 			json.NewEncoder(w).Encode(ipnstate.Status{
-				CurrentTailnet: &ipnstate.TailnetStatus{StableID: "test-tailnet"}, User: users,
+				CurrentTailnet: &ipnstate.TailnetStatus{StableID: "test-tailnet"}, User: users, Peer: peers,
 			})
 		case "/localapi/v0/prefs":
 			json.NewEncoder(w).Encode(ipn.Prefs{ControlURL: "https://control.example"})
@@ -584,7 +586,7 @@ func TestOwnershipIdentityBoundaries(t *testing.T) {
 }
 
 func TestTransferRejectsTaggedPrincipals(t *testing.T) {
-	for _, location := range []string{"self", "peer"} {
+	for _, location := range []string{"self", "peer", "cached", "untagged-self"} {
 		t.Run(location, func(t *testing.T) {
 			profiles := map[tailcfg.UserID]tailcfg.UserProfile{
 				101: {ID: 101, LoginName: "alice"},
@@ -592,19 +594,26 @@ func TestTransferRejectsTaggedPrincipals(t *testing.T) {
 				909: {ID: 909, LoginName: "tagged-devices"},
 			}
 			tags := views.SliceOf([]string{"tag:client"})
+			untaggedKey := key.NewNode().Public()
 			status := ipnstate.Status{
 				CurrentTailnet: &ipnstate.TailnetStatus{StableID: "test-tailnet"},
 				User:           profiles,
 				Peer: map[key.NodePublic]*ipnstate.PeerStatus{
-					key.NewNode().Public(): {UserID: 202},
+					untaggedKey:            {UserID: 202},
 					key.NewNode().Public(): {UserID: 202, Tags: &tags},
 				},
 			}
 			tagged := &ipnstate.PeerStatus{UserID: 909, Tags: &tags}
 			if location == "self" {
 				status.Self = tagged
-			} else {
+			} else if location != "cached" {
 				status.Peer[key.NewNode().Public()] = tagged
+			}
+			if location == "cached" {
+				status.Self = &ipnstate.PeerStatus{UserID: 101}
+			} else if location == "untagged-self" {
+				status.Self = &ipnstate.PeerStatus{UserID: 202}
+				delete(status.Peer, untaggedKey)
 			}
 			lc := testLocalClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
@@ -693,6 +702,10 @@ func TestTransferRejectsDuplicateLogin(t *testing.T) {
 		case "/localapi/v0/status":
 			json.NewEncoder(w).Encode(ipnstate.Status{
 				CurrentTailnet: &ipnstate.TailnetStatus{StableID: "test-tailnet"}, User: profiles,
+				Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+					key.NewNode().Public(): {UserID: 202},
+					key.NewNode().Public(): {UserID: 303},
+				},
 			})
 		case "/localapi/v0/prefs":
 			json.NewEncoder(w).Encode(ipn.Prefs{ControlURL: "https://control.example"})
@@ -788,6 +801,10 @@ func TestConcurrentOwnershipChanges(t *testing.T) {
 					}
 					json.NewEncoder(w).Encode(ipnstate.Status{
 						CurrentTailnet: &ipnstate.TailnetStatus{StableID: "test-tailnet"}, User: profiles,
+						Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+							key.NewNode().Public(): {UserID: 101},
+							key.NewNode().Public(): {UserID: 202},
+						},
 					})
 				case "/localapi/v0/prefs":
 					json.NewEncoder(w).Encode(ipn.Prefs{ControlURL: "https://control.example"})
@@ -919,6 +936,9 @@ func TestLegacyOwnershipDoesNotBindReusedLogin(t *testing.T) {
 					case "/localapi/v0/status":
 						json.NewEncoder(w).Encode(ipnstate.Status{
 							CurrentTailnet: &ipnstate.TailnetStatus{StableID: "test-tailnet"}, User: profiles,
+							Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+								key.NewNode().Public(): {UserID: 101},
+							},
 						})
 					case "/localapi/v0/prefs":
 						json.NewEncoder(w).Encode(ipn.Prefs{ControlURL: "https://control.example"})
