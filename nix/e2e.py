@@ -434,10 +434,23 @@ with subtest("ownership follows immutable identity across login reuse and restar
     }
     assert accounts["alice-renamed"] == original_id
     assert accounts["alice"] != original_id
+    tagged_bob_id = next(
+        n["id"]
+        for n in json.loads(headscale.succeed("headscale nodes list -o json"))
+        if n["name"] == "bob"
+    )
     bob.succeed("tailscale logout")
+    headscale.succeed(f"headscale nodes delete --identifier {tagged_bob_id} --force")
+    # Reload cached node-owner profiles after changing the control's user record.
+    headscale.succeed(
+        "systemctl restart headscale", "HEADSCALE_CLI_TIMEOUT=60s headscale health"
+    )
     reused_key = headscale.succeed("hs-authkey alice").strip()
     bob.succeed("hs-join " + shlex.quote(reused_key) + " --reset")
     bob.wait_until_succeeds(f"curl -fsS --max-time 5 {url}/", timeout=60)
+    newcomer = json.loads(bob.succeed("tailscale status --json"))["Self"]
+    assert str(newcomer["UserID"]) == str(accounts["alice"]), newcomer
+    assert not newcomer.get("Tags"), newcomer
     alice.wait_until_succeeds(
         f"curl -sS --max-time 5 -D - -o /dev/null {url}/identity/item "
         "| grep -F 'Location: https://example.com/alice-renamed/item'",
@@ -446,9 +459,6 @@ with subtest("ownership follows immutable identity across login reuse and restar
     assert str(
         json.loads(alice.succeed("tailscale status --json"))["Self"]["UserID"]
     ) == str(original_id)
-    assert str(
-        json.loads(bob.succeed("tailscale status --json"))["Self"]["UserID"]
-    ) == str(accounts["alice"])
     save(bob, "reused-login-control")
     save(bob, "renamed-owner", "https://attacker.example/", status=403)
     request(bob, "/.delete/renamed-delete", data=dict(xsrf=old_login_token), status=403)
