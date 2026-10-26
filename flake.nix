@@ -126,6 +126,12 @@
               '';
             };
 
+            identityScope = mkOption {
+              type = types.str;
+              default = "";
+              description = "Immutable operator-assigned tailnet scope for controls without a stable tailnet ID. Keep it unchanged across restarts and restores.";
+            };
+
             tailscaleAuthKeyFile = mkOption {
               type = types.nullOr types.path;
               default = null;
@@ -162,6 +168,7 @@
                   args = [
                     "--sqlitedb ${cfg.databaseFile}"
                     "--control-url ${cfg.controlUrl}"
+                    "--identity-scope ${escapeShellArg cfg.identityScope}"
                   ] ++ optionals cfg.verbose [ "--verbose" ];
                 in
                 ''

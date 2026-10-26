@@ -22,7 +22,24 @@
       <p class="text-sm text-gray-500"><a class="text-blue-600 hover:underline" href="/.help">Help and advanced options</a></p>
 
       <label for=owner class="text-sm font-bold block mt-4">Owner</label>
-      <input id=owner name=owner required type=text size=25 placeholder="Owner" value="{{.Link.Owner}}" class="p-2 rounded-md border-gray-300 placeholder:text-gray-400 disabled:bg-gray-100">
+      <input id=owner name=owner readonly type=text size=25 value="{{.Link.Owner}}" class="p-2 rounded-md border-gray-300 placeholder:text-gray-400 disabled:bg-gray-100">
+
+      {{ if not .NeedsOwner }}
+      <button type=submit class="py-2 px-4 my-4 rounded-md bg-blue-500 border-blue-500 text-white hover:bg-blue-600 hover:border-blue-600">Update</button>
+      {{ end }}
+
+      {{ if .NeedsOwner }}
+      <p>This legacy link needs verified administrator reassignment before it can be edited or deleted.</p>
+      {{ end }}
+
+      {{ if .Owners }}
+      <label for=owner-id class="text-sm font-bold block mt-4">Transfer to verified identity</label>
+      <select id=owner-id name=owner-id class="p-2 rounded-md border-gray-300">
+        <option value="">Select an owner</option>
+        {{ range .Owners }}<option value="{{.ID}}">{{.Login}} (user ID {{.UserID}})</option>{{ end }}
+      </select>
+      <button type=submit name=action value=transfer class="py-2 px-4 my-4 rounded-md bg-blue-500 border-blue-500 text-white hover:bg-blue-600 hover:border-blue-600">Transfer ownership</button>
+      {{ end }}
 
       <dl>
         <dt class="text-sm font-bold mt-6">Date Created</dt>
@@ -32,15 +49,16 @@
         <dd>{{.Link.LastEdit.Format "Jan _2, 2006 3:04pm MST"}}</dd>
       </dl>
 
-      <button type=submit class="py-2 px-4 my-4 rounded-md bg-blue-500 border-blue-500 text-white hover:bg-blue-600 hover:border-blue-600">Update</button>
     </form>
 
+    {{ if not .NeedsOwner }}
     <h3 class="text-lg font-bold pb-2 pt-4 text-red-500">Danger Zone</h3>
 
     <form method="POST" action="/.delete/{{.Link.Short}}">
       <input type="hidden" name="xsrf" value="{{ .XSRF }}" />
       <button type=submit class="py-2 px-4 my-2 rounded-md bg-red-500 border-red-500 text-white hover:bg-red-600 hover:border-red-600">Delete Link</button>
     </form>
+    {{ end }}
 
     {{ else }}
     <dl>

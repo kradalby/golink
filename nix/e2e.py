@@ -2,6 +2,7 @@ import csv
 import json
 import re
 import shlex
+from html import unescape
 from urllib.parse import urlencode
 
 url = "https://go.tailnet" if tls_enabled else "http://go.tailnet"
@@ -32,6 +33,23 @@ def request(peer, path="/", data=None, headers=(), status=200):
 
 
 def save(peer, short, long="https://example.com/", status=200, **fields):
+    if "owner" in fields:
+        owner = fields.pop("owner")
+        accounts = [
+            u["id"]
+            for u in json.loads(headscale.succeed("headscale users list -o json"))
+            if u["name"] == owner
+        ]
+        page = request(peer, "/.detail/" + short, headers=["Accept: text/html"])
+        choices = re.findall(
+            r'<option value="([^"]+)">[^<]* \(user ID (\d+)\)</option>', page
+        )
+        targets = [
+            unescape(value)
+            for value, user_id in choices
+            if len(accounts) == 1 and user_id == str(accounts[0])
+        ]
+        fields.update(action="transfer", **{"owner-id": targets[0] if targets else ""})
     body = request(
         peer,
         data=dict(short=short, long=long, **fields),
@@ -396,3 +414,73 @@ with subtest("invalid service configuration fails closed and recovers"):
     )
     alice.wait_until_succeeds(f"curl -fsS --max-time 5 {url}/", timeout=120)
     request(alice, "/owned", status=302)
+
+with subtest("ownership follows immutable identity across login reuse and restart"):
+    for short in ("renamed-owner", "renamed-delete"):
+        save(alice, short, "https://example.com/original-owner")
+    old_login_token = token(alice, "renamed-delete")
+    original_id = next(
+        u["id"]
+        for u in json.loads(headscale.succeed("headscale users list -o json"))
+        if u["name"] == "alice"
+    )
+    headscale.succeed(
+        f"headscale users rename --identifier {original_id} --new-name alice-renamed",
+        "headscale users create alice",
+    )
+    accounts = {
+        u["name"]: u["id"]
+        for u in json.loads(headscale.succeed("headscale users list -o json"))
+    }
+    assert accounts["alice-renamed"] == original_id
+    assert accounts["alice"] != original_id
+    bob.succeed("tailscale logout")
+    reused_key = headscale.succeed("hs-authkey alice").strip()
+    bob.succeed("hs-join " + shlex.quote(reused_key) + " --reset")
+    bob.wait_until_succeeds(f"curl -fsS --max-time 5 {url}/", timeout=60)
+    alice.wait_until_succeeds(
+        f"curl -sS --max-time 5 -D - -o /dev/null {url}/identity/item "
+        "| grep -F 'Location: https://example.com/alice-renamed/item'",
+        timeout=60,
+    )
+    assert str(
+        json.loads(alice.succeed("tailscale status --json"))["Self"]["UserID"]
+    ) == str(original_id)
+    assert str(
+        json.loads(bob.succeed("tailscale status --json"))["Self"]["UserID"]
+    ) == str(accounts["alice"])
+    save(bob, "reused-login-control")
+    save(bob, "renamed-owner", "https://attacker.example/", status=403)
+    request(bob, "/.delete/renamed-delete", data=dict(xsrf=old_login_token), status=403)
+    # An unchanged owner field from an older form must retain the original binding.
+    request(
+        alice,
+        data=dict(
+            short="renamed-owner",
+            long="https://example.com/original-owner",
+            owner="alice",
+        ),
+        headers=["Sec-Golink: test"],
+    )
+    save(bob, "renamed-owner", status=403)
+    server.succeed("systemctl restart golink")
+    alice.wait_until_succeeds(f"curl -fsS --max-time 5 {url}/", timeout=120)
+    save(bob, "renamed-owner", status=403)
+    request(bob, "/.delete/renamed-delete", data=dict(xsrf=old_login_token), status=403)
+    assert detail("renamed-delete")["Long"] == "https://example.com/original-owner"
+    request(
+        alice,
+        data=dict(
+            short="renamed-owner",
+            long="https://example.com/after-restart",
+            owner="alice",
+        ),
+        headers=["Sec-Golink: test"],
+    )
+    request(
+        alice, "/.delete/renamed-delete", data=dict(xsrf=token(alice, "renamed-delete"))
+    )
+    save(alice, "renamed-owner", owner="admin")
+    save(alice, "renamed-owner", status=403)
+    save(admin, "renamed-owner", owner="alice-renamed")
+    save(alice, "renamed-owner", "https://example.com/transferred-back")

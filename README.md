@@ -321,9 +321,42 @@ $ modal deploy golinks.py
 
 By default, users own the links they create and only they can update or delete those links.
 Ownership can be transferred to another user from the link edit page.
+Ownership follows the immutable user ID, scoped to the control-server issuer and
+tailnet. Login names are display labels. Ordinary saves preserve ownership,
+including saves from older open forms. Use **Transfer ownership** and verify the
+displayed user ID to assign a different owner; a login label alone is insufficient.
 Links retain their owner when that user is no longer visible in the tailnet.
 Visibility does not prove that an account was deleted. An administrator can
 explicitly transfer a departed owner's links to another user.
+
+On upgrade, the database adds an optional `OwnerID` column without assigning
+historical names to today's accounts. Existing named links remain readable and
+resolvable, with their labels, timestamps and click statistics intact. An
+administrator must verify and explicitly reassign each legacy owner before that
+link can be edited or deleted. Legacy `tagged-devices` labels are also ambiguous.
+New links from authenticated tagged nodes remain shared; unowned links remain shared.
+
+Control servers that do not report a stable tailnet ID, including the pinned
+Headscale fixture, require `-identity-scope` (NixOS: `services.golink.identityScope`).
+Choose an immutable unique value for that tailnet, not its display domain. An
+explicitly configured scope takes precedence and has a separate namespace from
+reported IDs. Keep both issuer URL and scope unchanged across restarts and
+restores. Changing either requires explicit administrator recovery; scopes are
+never silently aliased. Without sufficient identity, named writes fail closed;
+trusted Service headers without a successful immutable identity lookup are not
+anonymous and cannot acquire ownership.
+
+For API transfers, submit `action=transfer` and the complete `owner-id` value
+offered by the detail form, with normal XSRF or `Sec-Golink` protection. The old
+`owner` text parameter no longer transfers ownership. Concurrent ownership
+changes or creation collisions return HTTP 409; reload before retrying.
+XSRF tokens bind to immutable user identities (or individual tagged nodes),
+so accounts sharing a display label cannot reuse one another's tokens.
+
+Do not run old and new writers against the same database. Old writers and old
+exports can erase identity bindings, including by making links unowned. Rollback
+must be offline or read-only; downgrading authorization does not retain these
+protections. Back up the database before upgrading.
 
 Users can be granted admin access to edit all links using [ACL grants] in your tailnet policy file.
 For example, if you have your golink instance tagged with `tag:golink` and a user group named `group:golink-admins`,
@@ -369,6 +402,9 @@ At Tailscale, we snapshot our links weekly and store them in git.
 
 To restore links, specify the snapshot file on startup.
 Only links that don't already exist in the database will be added.
+New snapshots retain `OwnerID`; older snapshots retain their data but require
+the same explicit legacy-owner recovery. Link snapshots do not include click
+statistics; those are exported separately from `/.export-stats`.
 
     golink -snapshot links.json
 

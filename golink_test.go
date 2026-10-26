@@ -194,13 +194,13 @@ func TestReferrerPolicy(t *testing.T) {
 
 func TestServeSave(t *testing.T) {
 	s := newTestServer(t)
-	s.db.Save(&Link{Short: "link-owned-by-tagged-devices", Long: "/before", Owner: "tagged-devices"})
+	s.db.Save(&Link{Short: "link-owned-by-tagged-devices", Long: "/before", Owner: "tagged-devices", OwnerID: taggedOwnerID})
 
 	fooXSRF := func(short string) string {
-		return xsrftoken.Generate(s.xsrfKey, "foo@example.com", short)
+		return xsrftoken.Generate(s.xsrfKey, "dev/foo@example.com", short)
 	}
 	barXSRF := func(short string) string {
-		return xsrftoken.Generate(s.xsrfKey, "bar@example.com", short)
+		return xsrftoken.Generate(s.xsrfKey, "dev/bar@example.com", short)
 	}
 
 	tests := []struct {
@@ -233,28 +233,34 @@ func TestServeSave(t *testing.T) {
 			wantStatus: http.StatusOK,
 		},
 		{
-			name:        "disallow editing another's link",
-			short:       "who",
-			xsrf:        barXSRF("who"),
-			long:        "http://who/",
-			currentUser: func(*http.Request) (user, error) { return user{login: "bar@example.com"}, nil },
-			wantStatus:  http.StatusForbidden,
+			name:  "disallow editing another's link",
+			short: "who",
+			xsrf:  barXSRF("who"),
+			long:  "http://who/",
+			currentUser: func(*http.Request) (user, error) {
+				return user{login: "bar@example.com", ownerID: "dev/bar@example.com"}, nil
+			},
+			wantStatus: http.StatusForbidden,
 		},
 		{
-			name:        "allow editing link owned by tagged-devices",
-			short:       "link-owned-by-tagged-devices",
-			xsrf:        barXSRF("link-owned-by-tagged-devices"),
-			long:        "/after",
-			currentUser: func(*http.Request) (user, error) { return user{login: "bar@example.com"}, nil },
-			wantStatus:  http.StatusOK,
+			name:  "allow editing link owned by tagged-devices",
+			short: "link-owned-by-tagged-devices",
+			xsrf:  barXSRF("link-owned-by-tagged-devices"),
+			long:  "/after",
+			currentUser: func(*http.Request) (user, error) {
+				return user{login: "bar@example.com", ownerID: "dev/bar@example.com"}, nil
+			},
+			wantStatus: http.StatusOK,
 		},
 		{
-			name:        "admins can edit any link",
-			short:       "who",
-			xsrf:        barXSRF("who"),
-			long:        "http://who/",
-			currentUser: func(*http.Request) (user, error) { return user{login: "bar@example.com", isAdmin: true}, nil },
-			wantStatus:  http.StatusOK,
+			name:  "admins can edit any link",
+			short: "who",
+			xsrf:  barXSRF("who"),
+			long:  "http://who/",
+			currentUser: func(*http.Request) (user, error) {
+				return user{login: "bar@example.com", ownerID: "dev/bar@example.com", isAdmin: true}, nil
+			},
+			wantStatus: http.StatusOK,
 		},
 		{
 			name:        "disallow unknown users",
@@ -273,11 +279,13 @@ func TestServeSave(t *testing.T) {
 			wantStatus:        http.StatusOK,
 		},
 		{
-			name:         "redirect to detail page when creating link that already exists",
-			short:        "who",
-			xsrf:         barXSRF(newShortName),
-			long:         "http://who/updated",
-			currentUser:  func(*http.Request) (user, error) { return user{login: "bar@example.com", isAdmin: true}, nil },
+			name:  "redirect to detail page when creating link that already exists",
+			short: "who",
+			xsrf:  barXSRF(newShortName),
+			long:  "http://who/updated",
+			currentUser: func(*http.Request) (user, error) {
+				return user{login: "bar@example.com", ownerID: "dev/bar@example.com", isAdmin: true}, nil
+			},
 			wantStatus:   http.StatusSeeOther,
 			wantLocation: "/.detail/who?exists=1",
 		},
@@ -327,12 +335,12 @@ func TestServeSave(t *testing.T) {
 
 func TestServeDelete(t *testing.T) {
 	s := newTestServer(t)
-	s.db.Save(&Link{Short: "a", Owner: "a@example.com"})
-	s.db.Save(&Link{Short: "foo", Owner: "foo@example.com"})
-	s.db.Save(&Link{Short: "link-owned-by-tagged-devices", Long: "/before", Owner: "tagged-devices"})
+	s.db.Save(&Link{Short: "a", Owner: "a@example.com", OwnerID: "dev/a@example.com"})
+	s.db.Save(&Link{Short: "foo", Owner: "foo@example.com", OwnerID: "dev/foo@example.com"})
+	s.db.Save(&Link{Short: "link-owned-by-tagged-devices", Long: "/before", Owner: "tagged-devices", OwnerID: taggedOwnerID})
 
 	xsrf := func(short string) string {
-		return xsrftoken.Generate(s.xsrfKey, "foo@example.com", short)
+		return xsrftoken.Generate(s.xsrfKey, "dev/foo@example.com", short)
 	}
 
 	tests := []struct {
@@ -364,11 +372,13 @@ func TestServeDelete(t *testing.T) {
 			wantStatus: http.StatusOK,
 		},
 		{
-			name:        "admin can delete unowned link",
-			short:       "a",
-			currentUser: func(*http.Request) (user, error) { return user{login: "foo@example.com", isAdmin: true}, nil },
-			xsrf:        xsrf("a"),
-			wantStatus:  http.StatusOK,
+			name:  "admin can delete unowned link",
+			short: "a",
+			currentUser: func(*http.Request) (user, error) {
+				return user{login: "foo@example.com", ownerID: "dev/foo@example.com", isAdmin: true}, nil
+			},
+			xsrf:       xsrf("a"),
+			wantStatus: http.StatusOK,
 		},
 		{
 			name:       "invalid xsrf",

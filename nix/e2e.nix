@@ -58,6 +58,7 @@ pkgs.testers.runNixOSTest {
         enable = true;
         verbose = true;
         controlUrl = "http://headscale";
+        identityScope = "golink-testkit";
         tailscaleAuthKeyFile = "/var/lib/golink/authkey";
       };
       systemd.services.golink = {

@@ -19,7 +19,7 @@ func Test_SQLiteDB_SaveLoadDeleteLinks(t *testing.T) {
 	}
 
 	links := []*Link{
-		{Short: "short", Long: "long"},
+		{Short: "short", Long: "long", Owner: "display", OwnerID: "scoped-owner"},
 		{Short: "Foo.Bar", Long: "long"},
 	}
 
@@ -135,7 +135,7 @@ func Test_SQLiteDB_GetLinksByOwner(t *testing.T) {
 
 	// preload some links with owner
 	links := []*Link{
-		{Short: "a", Owner: "foo@bar.com"},
+		{Short: "a", Owner: "foo@bar.com", OwnerID: "scoped-owner"},
 		{Short: "B-c", Owner: "bar@foo.com "},
 	}
 	for _, link := range links {
@@ -145,7 +145,7 @@ func Test_SQLiteDB_GetLinksByOwner(t *testing.T) {
 	}
 
 	want := []*Link{
-		{Short: "a", Owner: "foo@bar.com"},
+		{Short: "a", Owner: "foo@bar.com", OwnerID: "scoped-owner"},
 	}
 	got, err := db.GetLinksByOwner("foo@bar.com")
 	if err != nil {
