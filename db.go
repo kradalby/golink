@@ -141,6 +141,52 @@ func (s *SQLiteDB) Save(link *Link) error {
 	return nil
 }
 
+var errLinkChanged = errors.New("link ownership changed; reload before retrying")
+
+// saveAuthorized cannot replace ownership established after the caller's check.
+func (s *SQLiteDB) saveAuthorized(link, before *Link) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var result sql.Result
+	var err error
+	if before == nil {
+		result, err = s.db.Exec("INSERT INTO Links (ID, Short, Long, Created, LastEdit, Owner) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(ID) DO NOTHING", linkID(link.Short), link.Short, link.Long, link.Created.Unix(), link.LastEdit.Unix(), link.Owner)
+	} else {
+		result, err = s.db.Exec("UPDATE Links SET Short = ?, Long = ?, LastEdit = ?, Owner = ? WHERE ID = ? AND Owner = ?", link.Short, link.Long, link.LastEdit.Unix(), link.Owner, linkID(before.Short), before.Owner)
+	}
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return errLinkChanged
+	}
+	return nil
+}
+
+// deleteAuthorized leaves a concurrently transferred link and its stats intact.
+func (s *SQLiteDB) deleteAuthorized(link *Link) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	result, err := s.db.Exec("DELETE FROM Links WHERE ID = ? AND Owner = ?", linkID(link.Short), link.Owner)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return errLinkChanged
+	}
+	return nil
+}
+
 // Delete removes a Link using its short name.
 func (s *SQLiteDB) Delete(short string) error {
 	s.mu.Lock()

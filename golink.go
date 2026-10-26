@@ -894,14 +894,14 @@ func (s *Server) serveDetail(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if short != link.Short {
-		// redirect to canonical short name
-		http.Redirect(w, r, "/.detail/"+link.Short, http.StatusFound)
-		return
-	}
 	if err != nil {
 		log.Printf("serving detail %q: %v", short, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if short != link.Short {
+		// redirect to canonical short name
+		http.Redirect(w, r, "/.detail/"+link.Short, http.StatusFound)
 		return
 	}
 
@@ -1197,6 +1197,10 @@ func (s *Server) serveDelete(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	if !s.canEditLink(r.Context(), link, cu) {
 		http.Error(w, fmt.Sprintf("cannot delete link owned by %q", link.Owner), http.StatusForbidden)
@@ -1213,7 +1217,10 @@ func (s *Server) serveDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.db.Delete(short); err != nil {
+	if err := s.db.deleteAuthorized(link); errors.Is(err, errLinkChanged) {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	} else if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1305,18 +1312,25 @@ func (s *Server) serveSave(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	newLink := false
+	before := link
 	if link == nil {
 		link = &Link{
 			Short:   short,
 			Created: now,
 		}
 		newLink = true
+	} else {
+		copy := *link
+		link = &copy
 	}
 	link.Short = short
 	link.Long = long
 	link.LastEdit = now
 	link.Owner = owner
-	if err := s.db.Save(link); err != nil {
+	if err := s.db.saveAuthorized(link, before); errors.Is(err, errLinkChanged) {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	} else if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1429,7 +1443,9 @@ func (s *Server) restoreSnapshot(snapshot []byte) error {
 		} else if !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
-		if err := s.db.Save(link); err != nil {
+		if err := s.db.saveAuthorized(link, nil); errors.Is(err, errLinkChanged) {
+			continue // concurrently created
+		} else if err != nil {
 			return err
 		}
 		restored++
