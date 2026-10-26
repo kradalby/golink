@@ -32,6 +32,8 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
+	"tailscale.com/types/views"
 )
 
 func testLocalClient(t *testing.T, handler http.Handler) *local.Client {
@@ -576,6 +578,100 @@ func TestOwnershipIdentityBoundaries(t *testing.T) {
 				if _, err := db.Load("new"); !errors.Is(err, fs.ErrNotExist) {
 					t.Errorf("unbound creation persisted: %v", err)
 				}
+			}
+		})
+	}
+}
+
+func TestTransferRejectsTaggedPrincipals(t *testing.T) {
+	for _, location := range []string{"self", "peer"} {
+		t.Run(location, func(t *testing.T) {
+			profiles := map[tailcfg.UserID]tailcfg.UserProfile{
+				101: {ID: 101, LoginName: "alice"},
+				202: {ID: 202, LoginName: "tagged-devices"},
+				909: {ID: 909, LoginName: "tagged-devices"},
+			}
+			tags := views.SliceOf([]string{"tag:client"})
+			status := ipnstate.Status{
+				CurrentTailnet: &ipnstate.TailnetStatus{StableID: "test-tailnet"},
+				User:           profiles,
+				Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+					key.NewNode().Public(): {UserID: 202},
+					key.NewNode().Public(): {UserID: 202, Tags: &tags},
+				},
+			}
+			tagged := &ipnstate.PeerStatus{UserID: 909, Tags: &tags}
+			if location == "self" {
+				status.Self = tagged
+			} else {
+				status.Peer[key.NewNode().Public()] = tagged
+			}
+			lc := testLocalClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/localapi/v0/whois":
+					profile := profiles[101]
+					if r.URL.Query().Get("addr") == "100.64.0.2:1234" {
+						profile = profiles[202]
+					}
+					json.NewEncoder(w).Encode(apitype.WhoIsResponse{Node: &tailcfg.Node{User: profile.ID}, UserProfile: &profile})
+				case "/localapi/v0/status":
+					json.NewEncoder(w).Encode(status)
+				case "/localapi/v0/prefs":
+					json.NewEncoder(w).Encode(ipn.Prefs{ControlURL: "https://control.example"})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			db, err := NewSQLiteDB(":memory:")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { db.db.Close() })
+			s, err := New(Options{DB: db, LocalClient: lc})
+			if err != nil {
+				t.Fatal(err)
+			}
+			post := func(addr, target string, want int) {
+				t.Helper()
+				data := url.Values{"short": {"owned"}, "long": {"https://example.com/"}}
+				if target != "" {
+					data.Set("action", "transfer")
+					data.Set("owner-id", `["https://control.example","reported","test-tailnet"]/`+target)
+				}
+				r := httptest.NewRequest("POST", "http://go/", strings.NewReader(data.Encode()))
+				r.RemoteAddr = addr
+				r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				r.Header.Set(secHeaderName, "test")
+				w := httptest.NewRecorder()
+				s.Handler().ServeHTTP(w, r)
+				if w.Code != want {
+					t.Errorf("transfer to %q: %d %s; want %d", target, w.Code, w.Body, want)
+				}
+			}
+			post("100.64.0.1:1234", "", http.StatusOK)
+			before, err := db.Load("owned")
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := httptest.NewRequest("GET", "http://go/.detail/owned", nil)
+			r.RemoteAddr = "100.64.0.1:1234"
+			r.Header.Set("Accept", "text/html")
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, r)
+			if w.Code != http.StatusOK || strings.Contains(w.Body.String(), "user ID 909)") || !strings.Contains(w.Body.String(), "tagged-devices (user ID 202)") {
+				t.Errorf("transfer choices must exclude tagged principal and retain same-label person: %d %s", w.Code, w.Body)
+			}
+			post("100.64.0.1:1234", "909", http.StatusBadRequest)
+			after, err := db.Load("owned")
+			if err != nil || !cmp.Equal(before, after) {
+				t.Fatalf("rejected tagged transfer changed link: %s, %v", cmp.Diff(before, after), err)
+			}
+			post("100.64.0.1:1234", "202", http.StatusOK)
+			post("100.64.0.1:1234", "", http.StatusForbidden)
+			post("100.64.0.2:1234", "", http.StatusOK)
+			after, err = db.Load("owned")
+			if err != nil || after.Owner != "tagged-devices" || after.OwnerID != `["https://control.example","reported","test-tailnet"]/202` {
+				t.Fatalf("same-label person lost immutable ownership: %v, %v", after, err)
 			}
 		})
 	}

@@ -38,6 +38,7 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
@@ -1187,7 +1188,7 @@ func (s *Server) defaultExtractUserFromHeaders(r *http.Request) user {
 }
 
 // identityDirectory scopes IDs to their issuer and an immutable tailnet namespace.
-func (s *Server) identityDirectory(ctx context.Context) (string, map[tailcfg.UserID]tailcfg.UserProfile, error) {
+func (s *Server) identityDirectory(ctx context.Context) (string, *ipnstate.Status, error) {
 	if s.dev {
 		return "dev", nil, nil
 	}
@@ -1210,7 +1211,7 @@ func (s *Server) identityDirectory(ctx context.Context) (string, map[tailcfg.Use
 		return "", nil, errors.New("missing identity issuer")
 	}
 	key, err := json.Marshal([3]string{prefs.ControlURL, kind, scope})
-	return string(key), st.User, err
+	return string(key), st, err
 }
 
 type ownerChoice struct {
@@ -1220,12 +1221,26 @@ type ownerChoice struct {
 }
 
 func (s *Server) ownerChoices(ctx context.Context) ([]ownerChoice, error) {
-	scope, profiles, err := s.identityDirectory(ctx)
-	if err != nil {
+	scope, st, err := s.identityDirectory(ctx)
+	if err != nil || st == nil {
 		return nil, err
 	}
+	// Tagged-only profiles cannot authenticate as named owners.
+	hasUntaggedNode := make(map[tailcfg.UserID]bool)
+	record := func(peer *ipnstate.PeerStatus) {
+		if peer != nil {
+			hasUntaggedNode[peer.UserID] = hasUntaggedNode[peer.UserID] || !peer.IsTagged()
+		}
+	}
+	record(st.Self)
+	for _, peer := range st.Peer {
+		record(peer)
+	}
 	var owners []ownerChoice
-	for id, profile := range profiles {
+	for id, profile := range st.User {
+		if untagged, known := hasUntaggedNode[id]; known && !untagged {
+			continue
+		}
 		if id > 0 && profile.ID == id {
 			owners = append(owners, ownerChoice{ID: scope + "/" + fmt.Sprint(int64(id)), Login: profile.LoginName, UserID: int64(id)})
 		}
